@@ -96,7 +96,7 @@ jobs:
   test-libraries:
     runs-on: ubuntu-latest
     # `packages: read` lets GITHUB_TOKEN resolve @facioquo scope from GitHub
-    # Packages (react-ui + tokens consumed by the web/ workspace — FAC-2121).
+    # Packages (react-ui + tokens consumed by the web/ workspace).
     permissions:
       contents: read
       packages: read
@@ -144,7 +144,7 @@ jobs:
     needs: [test-libraries]
     runs-on: ubuntu-latest
     # `packages: read` lets GITHUB_TOKEN resolve @facioquo scope from GitHub
-    # Packages (react-ui + tokens consumed by the web/ workspace — FAC-2121).
+    # Packages (react-ui + tokens consumed by the web/ workspace).
     permissions:
       contents: read
       packages: read
@@ -265,7 +265,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test-libraries, test-website]
     # `packages: read` lets GITHUB_TOKEN resolve @facioquo scope from GitHub
-    # Packages (react-ui + tokens consumed by the web/ workspace — FAC-2121).
+    # Packages (react-ui + tokens consumed by the web/ workspace).
     permissions:
       contents: read
       packages: read
@@ -316,7 +316,8 @@ jobs:
 
   lint-and-test:
     runs-on: ubuntu-slim
-    needs: [test-backend, test-libraries, test-website, test-web, test-e2e]
+    needs:
+      [test-backend, test-libraries, test-website, test-web, test-e2e]
     if: always()
     steps:
       - name: Verify required jobs succeeded
