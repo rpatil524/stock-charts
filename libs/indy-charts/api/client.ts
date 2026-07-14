@@ -7,6 +7,132 @@ import {
   type Bar
 } from "../config/types";
 
+// ---------------------------------------------------------------------------
+// Retry helpers
+// ---------------------------------------------------------------------------
+
+const DEFAULT_MAX_ATTEMPTS = 3;
+const DEFAULT_BASE_DELAY_MS = 500;
+/**
+ * Upper bound applied to any retry delay — both the exponential back-off window
+ * and a server-supplied `Retry-After` value — so a high `maxAttempts`/`baseDelayMs`
+ * combination or a large/misconfigured header cannot pin a browser tab for an
+ * extended period.
+ */
+const MAX_RETRY_DELAY_MS = 30_000;
+const STALE_CACHE_PREFIX = "indy-charts:stale:";
+
+function isTransientStatus(status: number): boolean {
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Computes exponential back-off delay with full jitter (AWS Architecture Blog recommendation).
+ * The exponential window is capped at {@link MAX_RETRY_DELAY_MS} so deep retry
+ * counts cannot produce an unbounded wait.
+ * @param retryIndex - Zero-based retry index (0 on first retry).
+ * @param baseDelayMs - Starting delay in milliseconds.
+ * @returns Delay in milliseconds: a random value in `[0, min(baseDelayMs × 2^retryIndex, MAX_RETRY_DELAY_MS)]`.
+ */
+function backoffMs(retryIndex: number, baseDelayMs: number): number {
+  const exponential = Math.min(baseDelayMs * Math.pow(2, retryIndex), MAX_RETRY_DELAY_MS);
+  return Math.floor(Math.random() * exponential);
+}
+
+/**
+ * Parses the value of a `Retry-After` HTTP header into milliseconds.
+ * Accepts either a delay-in-seconds integer or an HTTP-date string.
+ * Returns `null` when the header value cannot be interpreted.
+ */
+function parseRetryAfterMs(header: string): number | null {
+  const seconds = Number(header.trim());
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000);
+  // HTTP-date (RFC 9110 §10.2.3 IMF-fixdate) form. `Date` parsing of non-ISO
+  // formats is implementation-defined, but all major browser engines accept it;
+  // an unparseable value simply falls through to the exponential back-off path.
+  const date = new Date(header.trim());
+  if (!Number.isNaN(date.getTime())) {
+    const ms = date.getTime() - Date.now();
+    return ms > 0 ? ms : 0;
+  }
+  return null;
+}
+
+/**
+ * Wraps `fetch` with exponential back-off retry for transient failures.
+ *
+ * - Retries on network errors (fetch rejection), `5xx`, and `429`.
+ * - Respects the `Retry-After` response header on `429`.
+ * - Returns immediately on `2xx` and non-transient `4xx`.
+ * - After `maxAttempts` attempts the last error/response is surfaced.
+ */
+async function fetchWithRetry(
+  url: string,
+  maxAttempts: number,
+  baseDelayMs: number
+): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    const isLast = attempt >= maxAttempts - 1;
+    let delayMs: number | null = null;
+    try {
+      const response = await fetch(url);
+      if (response.ok || !isTransientStatus(response.status) || isLast) {
+        return response;
+      }
+      // transient HTTP error on a non-final attempt — honour Retry-After if present,
+      // clamped to a ceiling so a misconfigured origin can't stall the client.
+      const retryAfter = response.headers.get("Retry-After");
+      if (retryAfter !== null) {
+        const parsed = parseRetryAfterMs(retryAfter);
+        delayMs = parsed !== null ? Math.min(parsed, MAX_RETRY_DELAY_MS) : null;
+      }
+    } catch (networkError) {
+      if (isLast) throw networkError;
+      // network error on a non-final attempt — retry
+    }
+    await sleep(delayMs ?? backoffMs(attempt, baseDelayMs));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stale-cache helpers (sessionStorage, browser-only)
+// ---------------------------------------------------------------------------
+
+function getSessionStorage(): Storage | null {
+  try {
+    return typeof sessionStorage !== "undefined" ? sessionStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+function tryStaleCacheRead<T>(url: string): T | null {
+  const storage = getSessionStorage();
+  if (!storage) return null;
+  try {
+    const raw = storage.getItem(STALE_CACHE_PREFIX + url);
+    return raw !== null ? (JSON.parse(raw) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+function tryStaleCacheWrite(url: string, data: unknown): void {
+  const storage = getSessionStorage();
+  if (!storage) return;
+  try {
+    storage.setItem(STALE_CACHE_PREFIX + url, JSON.stringify(data));
+  } catch {
+    // Ignore quota-exceeded or other errors (e.g. private-browsing restrictions)
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 const STYLE_COLORS = {
   ORANGE: "#EF6C00",
   RED: "#DD2C00",
@@ -15,6 +141,24 @@ const STYLE_COLORS = {
   DARK_GRAY: "#616161CC",
   DARK_GRAY_TRANSPARENT: "#61616110"
 } as const;
+
+/**
+ * Retry policy for transient API failures used by {@link ApiClientConfig}.
+ */
+export interface RetryConfig {
+  /**
+   * Maximum number of fetch attempts (initial attempt + retries).
+   * `1` disables retries. Defaults to `3`.
+   */
+  maxAttempts?: number;
+  /**
+   * Base delay in milliseconds for exponential back-off.
+   * Actual delay for retry `n` ≈ random value in `[0, baseDelayMs × 2^(n−1)]` (full jitter),
+   * with the window capped at 30 seconds so deep retry counts stay bounded.
+   * Defaults to `500`.
+   */
+  baseDelayMs?: number;
+}
 
 /**
  * Configuration for {@link createApiClient}.
@@ -44,13 +188,41 @@ export interface ApiClientConfig {
 
   /**
    * Optional error callback invoked whenever a fetch operation throws or
-   * receives a non-2xx response.  The error is **re-thrown** after the
-   * callback returns, so callers still need to handle it.
+   * receives a non-2xx response.  When `staleCache` is enabled and a cached
+   * value is available the error is **not** re-thrown (the promise resolves
+   * with stale data); otherwise the error is **re-thrown** after the callback
+   * returns, so callers still need to handle it.
    *
    * @param context - Human-readable description of the failed operation.
    * @param error   - The original caught value (usually an `Error` instance).
    */
   onError?: (context: string, error: unknown) => void;
+
+  /**
+   * Retry policy for transient failures — network errors, `5xx`, and `429`.
+   *
+   * Set to `false` to disable all retries.
+   * Defaults to `{ maxAttempts: 3, baseDelayMs: 500 }`.
+   */
+  retry?: RetryConfig | false;
+
+  /**
+   * When `true`, each successful response is stored in `sessionStorage` (browser
+   * only).  If all retries fail, the last stored value is returned and
+   * {@link onStale} is called so the consumer can surface a "stale data" indicator.
+   *
+   * Defaults to `false`.
+   */
+  staleCache?: boolean;
+
+  /**
+   * Called when stale cached data is returned because the live request and all
+   * retries failed.
+   *
+   * @param context - Human-readable description of the operation that is stale
+   *                  (e.g. `"quotes"`, `"listings"`, `"selection data"`).
+   */
+  onStale?: (context: string) => void;
 }
 
 /**
@@ -63,7 +235,8 @@ export interface ApiClient {
    * Fetches the raw OHLCV quote history from `GET /quotes`.
    *
    * @returns Resolved array of {@link Bar} objects sorted chronologically.
-   * @throws  Re-throws any network or HTTP error (after calling `onError`).
+   * @throws  Re-throws any network or HTTP error (after calling `onError`) unless
+   *          stale cached data is available.
    */
   getQuotes(): Promise<Bar[]>;
 
@@ -71,7 +244,8 @@ export interface ApiClient {
    * Fetches all available indicator listings from `GET /indicators`.
    *
    * @returns Resolved array of {@link IndicatorListing} descriptors.
-   * @throws  Re-throws any network or HTTP error (after calling `onError`).
+   * @throws  Re-throws any network or HTTP error (after calling `onError`) unless
+   *          stale cached data is available.
    */
   getListings(): Promise<IndicatorListing[]>;
 
@@ -82,7 +256,8 @@ export interface ApiClient {
    * @param selection - The user's current indicator parameter choices.
    * @param listing   - The indicator descriptor that provides the endpoint path.
    * @returns Resolved array of raw data rows for the indicator series.
-   * @throws  Re-throws any network or HTTP error (after calling `onError`).
+   * @throws  Re-throws any network or HTTP error (after calling `onError`) unless
+   *          stale cached data is available.
    */
   getSelectionData(
     selection: IndicatorSelection,
@@ -248,14 +423,28 @@ function normalizeResult(uiid: string, result: IndicatorResultConfig): Indicator
  * ```
  */
 export function createApiClient(config: ApiClientConfig): ApiClient {
-  const { endpoints, onError } = config;
+  const { endpoints, onError, staleCache, onStale } = config;
   // Ensure baseUrl always ends with "/" so new URL(path, base) resolves correctly.
   const baseUrl = config.baseUrl.endsWith("/") ? config.baseUrl : `${config.baseUrl}/`;
 
+  const retryEnabled = config.retry !== false;
+  const rawMaxAttempts = retryEnabled
+    ? ((config.retry as RetryConfig | undefined)?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS)
+    : 1;
+  // Guard against Infinity or non-positive values which would produce an infinite loop.
+  const maxAttempts =
+    retryEnabled && (!Number.isFinite(rawMaxAttempts) || rawMaxAttempts < 1)
+      ? DEFAULT_MAX_ATTEMPTS
+      : rawMaxAttempts;
+  const baseDelayMs = retryEnabled
+    ? ((config.retry as RetryConfig | undefined)?.baseDelayMs ?? DEFAULT_BASE_DELAY_MS)
+    : 0;
+
   return {
     async getQuotes(): Promise<Bar[]> {
+      const url = endpointUrl(baseUrl, endpoints?.quotes ?? "quotes");
       try {
-        const response = await fetch(endpointUrl(baseUrl, endpoints?.quotes ?? "quotes"));
+        const response = await fetchWithRetry(url, maxAttempts, baseDelayMs);
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
@@ -263,22 +452,55 @@ export function createApiClient(config: ApiClientConfig): ApiClient {
         if (!Array.isArray(body)) {
           throw new Error("Invalid quotes response: expected an array");
         }
-        return normalizeQuotes(body);
+        const result = normalizeQuotes(body);
+        if (staleCache) tryStaleCacheWrite(url, body);
+        return result;
       } catch (error) {
+        if (staleCache) {
+          const cached = tryStaleCacheRead<unknown[]>(url);
+          // Guard against a tampered or corrupted cache entry before normalizing.
+          if (Array.isArray(cached)) {
+            try {
+              const staleData = normalizeQuotes(cached);
+              onError?.("Error fetching quotes", error);
+              onStale?.("quotes");
+              return staleData;
+            } catch {
+              // Malformed cached data — fall through to surface original fetch error.
+            }
+          }
+        }
         onError?.("Error fetching quotes", error);
         throw error;
       }
     },
 
     async getListings(): Promise<IndicatorListing[]> {
+      const url = endpointUrl(baseUrl, endpoints?.indicators ?? "indicators");
       try {
-        const response = await fetch(endpointUrl(baseUrl, endpoints?.indicators ?? "indicators"));
+        const response = await fetchWithRetry(url, maxAttempts, baseDelayMs);
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
         const data = (await response.json()) as IndicatorListing[];
-        return normalizeListings(data);
+        const result = normalizeListings(data);
+        if (staleCache) tryStaleCacheWrite(url, data);
+        return result;
       } catch (error) {
+        if (staleCache) {
+          const cached = tryStaleCacheRead<IndicatorListing[]>(url);
+          // Guard against a tampered or corrupted cache entry before normalizing.
+          if (Array.isArray(cached)) {
+            try {
+              const staleData = normalizeListings(cached);
+              onError?.("Error fetching listings", error);
+              onStale?.("listings");
+              return staleData;
+            } catch {
+              // Malformed cached data — fall through to surface original fetch error.
+            }
+          }
+        }
         onError?.("Error fetching listings", error);
         throw error;
       }
@@ -288,17 +510,17 @@ export function createApiClient(config: ApiClientConfig): ApiClient {
       selection: IndicatorSelection,
       listing: IndicatorListing
     ): Promise<IndicatorDataRow[]> {
-      const endpointUrl = new URL(listing.endpoint, baseUrl);
+      const selectionEndpoint = new URL(listing.endpoint, baseUrl);
       selection.params.forEach((p: IndicatorParam) => {
         if (p.value != null) {
-          endpointUrl.searchParams.set(p.paramName, String(p.value));
+          selectionEndpoint.searchParams.set(p.paramName, String(p.value));
         }
       });
 
-      const url = endpointUrl.toString();
+      const url = selectionEndpoint.toString();
 
       try {
-        const response = await fetch(url);
+        const response = await fetchWithRetry(url, maxAttempts, baseDelayMs);
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
@@ -306,8 +528,19 @@ export function createApiClient(config: ApiClientConfig): ApiClient {
         if (!Array.isArray(body)) {
           throw new Error("Invalid selection data response: expected an array");
         }
-        return body as IndicatorDataRow[];
+        const result = body as IndicatorDataRow[];
+        if (staleCache) tryStaleCacheWrite(url, result);
+        return result;
       } catch (error) {
+        if (staleCache) {
+          const cached = tryStaleCacheRead<IndicatorDataRow[]>(url);
+          // Guard against a tampered or corrupted cache entry, mirroring the live path.
+          if (Array.isArray(cached)) {
+            onError?.("Error fetching selection data", error);
+            onStale?.("selection data");
+            return cached;
+          }
+        }
         onError?.("Error fetching selection data", error);
         throw error;
       }
